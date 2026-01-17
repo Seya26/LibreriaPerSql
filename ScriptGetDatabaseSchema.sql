@@ -1,10 +1,10 @@
 SELECT 
     SCHEMA_NAME(t.schema_id) AS SchemaName,
     t.name AS TableName,
-    td.value AS TableDescription,
+    CAST(td.value AS NVARCHAR(MAX)) AS TableDescription, -- Cast per sicurezza
     c.name AS ColumnName,
     
-    -- Creiamo una stringa leggibile per il tipo di dato (es. NVARCHAR(50))
+    -- Logica per formattare il tipo di dato direttamente in SQL
     UPPER(ty.name) + 
     CASE 
         WHEN ty.name IN ('nvarchar', 'nchar') AND c.max_length != -1 
@@ -19,7 +19,7 @@ SELECT
     END AS FullDataType,
 
     c.is_nullable AS IsNullable,
-    cd.value AS ColumnDescription
+    CAST(cd.value AS NVARCHAR(MAX)) AS ColumnDescription
 
 FROM sys.tables t
 -- Join Descrizione Tabella
@@ -34,4 +34,3 @@ LEFT JOIN sys.extended_properties cd
     ON t.object_id = cd.major_id 
     AND c.column_id = cd.minor_id 
     AND cd.name = 'MS_Description'
-ORDER BY t.name, c.column_id;
