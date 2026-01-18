@@ -27,7 +27,7 @@ namespace LibreriaPerSql.Services
         {
             var schemaQuery = GetScriptGetSchema();
 
-            string queryFilter = "";    
+            string queryFilter = "";  
             if(tablesToInclude is not null && tablesToInclude.Any())
             {
                 queryFilter += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
