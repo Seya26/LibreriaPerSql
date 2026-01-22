@@ -51,11 +51,14 @@ namespace LibreriaPerSql.Services
         public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
         {
             //Chiave per la cache che identifica se la whitelist è cambiata e quindi di riscaricare lo schema o di utilizzare quello presente nella cache
+            // Se ce una whitelist, gli crea un nome (es.. schema_Students_Courses) per permettere di controllare se esiste nella cache lo stesso schema (esso viene poi orderBy alfabeticamente per evitare problemi di ordine (! schema_Courses_Students...sono la stessa cosa)
+            // se invece whitelist nulla, allora etichetta con "Schema_All_Tables" cosi prende dalla cache la variabile con la giusta etichetta
             string cacheKey = tablesToInclude != null && tablesToInclude.Any() 
                 ? $"Schema_{string.Join("_", tablesToInclude.OrderBy(x => x))}" 
                 : "Schema_All_Tables";
 
-            //Restituiamo subito lo schema se gia presente
+            //Restituiamo subito lo schema se gia presente con l'etichetta che gli abbiamo dato prima
+            //Se ce, la restituisce 'out' in cachedJson
             if (_cache.TryGetValue(cacheKey, out string? cachedJson))
             {
                 return cachedJson;
