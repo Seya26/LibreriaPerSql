@@ -25,6 +25,7 @@ namespace LibreriaPerSql.Extensions
             //    default:
             //        throw new NotSupportedException($"The provider '{dbConfig.ProviderSQL}' is not supported.");
             //}
+            services.AddMemoryCache();
             services.AddScoped<IDbService, DbService>();
             return services;
         }

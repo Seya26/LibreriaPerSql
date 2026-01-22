@@ -2,6 +2,7 @@
 using LibreriaPerSql.Configurations;
 using LibreriaPerSql.DTO;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using System.Reflection;
 using System.Text.Json;
@@ -12,10 +13,34 @@ namespace LibreriaPerSql.Services
     public class DbService : IDbService
     {
         private readonly DbConfig _config;
-        private const string _EmbeddedSqlName = "ScriptGetDatabaseSchema.sql";
-        public DbService(IOptions<DbConfig> config)
+        private readonly IMemoryCache _cache;
+
+        // Variabile che tramite lambda function estrae lo script sql incorporato per estrapolare lo schema di un db
+        // Lazy<T> permette di caricare la risorsa solo alla prima chiamata quando è realmente necessaria, senno restituisce (le chiamate successive) il valore memorizzato (caching)
+        // Static perchè lo script è lo stesso per tutte le istanze di DbService (non cambia mai)
+        private static readonly Lazy<string> _scriptSchemaSql = new Lazy<string>(() =>
+        {
+            const string embeddedSqlName = "ScriptGetDatabaseSchema.sql";
+            // Determina l'assembly che contiene la risorsa incorporata
+            var assembly = Assembly.GetExecutingAssembly();
+
+            // Prende tutte le risorse incorporate e cerca quella che finisce con il nome del file (ignora il namespace)
+            var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(embeddedSqlName));
+            if (resourceName is null) throw new FileNotFoundException($"Embedded file {embeddedSqlName} not founded");
+
+            // Apre lo stream della risorsa incorporata 
+            using Stream? stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream is null) throw new InvalidOperationException($"Found the name '{resourceName}', but the stream is null. Something is wrong in loading the resource.");
+
+            // Reader per leggere e ritornare il contenuto della risorsa come stringa 
+            using StreamReader reader = new(stream);
+            return reader.ReadToEnd();
+        });
+
+        public DbService(IOptions<DbConfig> config, IMemoryCache cache)
         {
             _config = config.Value;
+            _cache = cache;
         }
 
         private SqlConnection CreateConnection()
@@ -25,10 +50,21 @@ namespace LibreriaPerSql.Services
 
         public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
         {
-            var schemaQuery = GetScriptGetSchema();
+            //Chiave per la cache che identifica se la whitelist è cambiata e quindi di riscaricare lo schema o di utilizzare quello presente nella cache
+            string cacheKey = tablesToInclude != null && tablesToInclude.Any() 
+                ? $"Schema_{string.Join("_", tablesToInclude.OrderBy(x => x))}" 
+                : "Schema_All_Tables";
 
-            string queryFilter = "";  
-            if(tablesToInclude is not null && tablesToInclude.Any())
+            //Restituiamo subito lo schema se gia presente
+            if (_cache.TryGetValue(cacheKey, out string? cachedJson))
+            {
+                return cachedJson;
+            }
+
+            var schemaQuery = _scriptSchemaSql.Value;
+
+            string queryFilter = "";
+            if (tablesToInclude is not null && tablesToInclude.Any())
             {
                 queryFilter += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
             }
@@ -36,12 +72,13 @@ namespace LibreriaPerSql.Services
             //Aggiungo il filtro per le tabelle
             schemaQuery += queryFilter;
 
-            using var connection = CreateConnection();
             IEnumerable<RawSchemaDTO> rawSchema;
             try
             {
-                rawSchema = await connection.QueryAsync<RawSchemaDTO>(schemaQuery, new {Tables = tablesToInclude});
-            }catch(SqlException ex)
+                using var connection = CreateConnection();
+                rawSchema = await connection.QueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = tablesToInclude });
+            }
+            catch (SqlException ex)
             {
                 throw new Exception($"Errore durante la lettura dello schema DB: {ex.Message}", ex);
             }
@@ -61,31 +98,17 @@ namespace LibreriaPerSql.Services
                 });
 
             // Serializzazione che rispetta i null (se Description manca, il campo viene omesso o messo a null)
-            return JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
+            var JsonResult = JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
             {
                 WriteIndented = true,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             });
-        }
 
-        private string GetScriptGetSchema()
-        {
-            var assembly = Assembly.GetExecutingAssembly();
-
-            // Cerca la risorsa che finisce con il nome file (ignora il namespace)
-            var resourceName = assembly.GetManifestResourceNames()
-                .FirstOrDefault(str => str.EndsWith(_EmbeddedSqlName));
-
-            if (resourceName is null)
-                throw new FileNotFoundException($"Impossibile trovare la risorsa incorporata: '{_EmbeddedSqlName}'.");
-
-            using Stream? stream = assembly.GetManifestResourceStream(resourceName);
-            if(stream is null)
-            {
-                throw new InvalidOperationException($"Trovato il nome '{resourceName}', ma lo stream è null. Qualcosa non va nel caricamento della risorsa.");
-            }
-            using StreamReader reader = new(stream);
-            return reader.ReadToEnd();
+            var cacheOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromHours(1))
+                .SetPriority(CacheItemPriority.High);
+            _cache.Set(cacheKey, JsonResult, cacheOptions);
+            return JsonResult;
         }
 
         public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null)
