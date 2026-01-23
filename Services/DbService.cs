@@ -26,11 +26,11 @@ namespace LibreriaPerSql.Services
 
             // Prende tutte le risorse incorporate e cerca quella che finisce con il nome del file (ignora il namespace)
             var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(embeddedSqlName));
-            if (resourceName is null) throw new FileNotFoundException($"Embedded file {embeddedSqlName} not founded");
+            if (resourceName == null) throw new FileNotFoundException($"Embedded file {embeddedSqlName} not founded");
 
             // Apre lo stream della risorsa incorporata 
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
-            if (stream is null) throw new InvalidOperationException($"Found the name '{resourceName}', but the stream is null. Something is wrong in loading the resource.");
+            if (stream == null) throw new InvalidOperationException($"Found the name '{resourceName}', but the stream is null. Something is wrong in loading the resource.");
 
             // Reader per leggere e ritornare il contenuto della risorsa come stringa 
             using StreamReader reader = new(stream);
@@ -61,13 +61,13 @@ namespace LibreriaPerSql.Services
             //Se ce, la restituisce 'out' in cachedJson
             if (_cache.TryGetValue(cacheKey, out string? cachedJson))
             {
-                return cachedJson;
+                return cachedJson!;
             }
 
             var schemaQuery = _scriptSchemaSql.Value;
 
             string queryFilter = "";
-            if (tablesToInclude is not null && tablesToInclude.Any())
+            if (tablesToInclude != null && tablesToInclude.Any())
             {
                 queryFilter += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
             }
@@ -83,7 +83,7 @@ namespace LibreriaPerSql.Services
             }
             catch (SqlException ex)
             {
-                throw new Exception($"Errore durante la lettura dello schema DB: {ex.Message}", ex);
+                throw new Exception($"Error during DB reading: {ex.Message}", ex);
             }
             // Trasformazione in memoria per creare la gerarchia Tabella -> Colonne
             var schemaStructured = rawSchema
