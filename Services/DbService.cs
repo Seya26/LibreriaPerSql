@@ -2,9 +2,11 @@
 using LibreriaPerSql.Configurations;
 using LibreriaPerSql.DTO;
 using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
+using System.Data;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -13,7 +15,6 @@ namespace LibreriaPerSql.Services
     public class DbService : IDbService
     {
         private readonly DbConfig _config;
-        private readonly IMemoryCache _cache;
 
         // Variabile che tramite lambda function estrae lo script sql incorporato per estrapolare lo schema di un db
         // Lazy<T> permette di caricare la risorsa solo alla prima chiamata quando è realmente necessaria, senno restituisce (le chiamate successive) il valore memorizzato (caching)
@@ -37,10 +38,9 @@ namespace LibreriaPerSql.Services
             return reader.ReadToEnd();
         });
 
-        public DbService(IOptions<DbConfig> config, IMemoryCache cache)
+        public DbService(IOptions<DbConfig> config)
         {
             _config = config.Value;
-            _cache = cache;
         }
 
         private SqlConnection CreateConnection()
@@ -48,44 +48,79 @@ namespace LibreriaPerSql.Services
             return new SqlConnection(_config.ConnectionString);
         }
 
-        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
+        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null)
         {
-            //Chiave per la cache che identifica se la whitelist è cambiata e quindi di riscaricare lo schema o di utilizzare quello presente nella cache
-            // Se ce una whitelist, gli crea un nome (es.. schema_Students_Courses) per permettere di controllare se esiste nella cache lo stesso schema (esso viene poi orderBy alfabeticamente per evitare problemi di ordine (! schema_Courses_Students...sono la stessa cosa)
-            // se invece whitelist nulla, allora etichetta con "Schema_All_Tables" cosi prende dalla cache la variabile con la giusta etichetta
-            string cacheKey = tablesToInclude != null && tablesToInclude.Any()
-                ? $"Schema_{string.Join("_", tablesToInclude.OrderBy(x => x))}"
-                : "Schema_All_Tables";
-
-            //Restituiamo subito lo schema se gia presente con l'etichetta che gli abbiamo dato prima
-            //Se ce, la restituisce 'out' in cachedJson
-            if (_cache.TryGetValue(cacheKey, out string? cachedJson))
-            {
-                return cachedJson!;
-            }
-
-            var schemaQuery = _scriptSchemaSql.Value;
-
-            string queryFilter = "";
-            if (tablesToInclude != null && tablesToInclude.Any())
-            {
-                queryFilter += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
-            }
-            queryFilter += "\nORDER BY t.name, c.column_id;";
-            //Aggiungo il filtro per le tabelle
-            schemaQuery += queryFilter;
-
-            IEnumerable<RawSchemaDTO> rawSchema;
+            ArgumentNullException.ThrowIfNullOrEmpty(sql);
+            using var connection = CreateConnection();
             try
             {
-                using var connection = CreateConnection();
-                rawSchema = await connection.QueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = tablesToInclude });
+                return await connection.QueryAsync<T>(sql, parameters);
             }
             catch (SqlException ex)
             {
                 throw new Exception($"Error during DB reading: {ex.Message}", ex);
             }
-            // Trasformazione in memoria per creare la gerarchia Tabella -> Colonne
+            catch (Exception ex)
+            {
+                throw new Exception(ex.Message, ex);
+            }
+        }
+
+        public async Task<int> ExecuteCommandAsync(string sql, object? parameters = null, IDbTransaction? transaction = null)
+        {
+            ArgumentNullException.ThrowIfNullOrEmpty(sql);
+
+            if (transaction != null)
+            {
+                try
+                {
+                    return await transaction.Connection!.ExecuteAsync(sql, parameters, transaction);
+                }
+                catch (SqlException ex)
+                {
+                    throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception(ex.Message, ex);
+                }
+            }
+
+            using var connection = CreateConnection();
+            try
+            {
+                return await connection.ExecuteAsync(sql, parameters);
+            }
+            catch (SqlException ex)
+            {
+                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(ex.Message, ex);
+            }
+        }
+
+        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
+        {
+            var schemaQuery = _scriptSchemaSql.Value;
+
+            if (tablesToInclude != null && tablesToInclude.Any())
+            {
+                schemaQuery += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
+            }
+            schemaQuery += "\nORDER BY t.name, c.column_id;";
+
+            IEnumerable<RawSchemaDTO> rawSchema;
+            try
+            {
+                rawSchema = await ExecuteQueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = tablesToInclude });
+            }
+            catch (SqlException ex)
+            {
+                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+            }
+
             var schemaStructured = rawSchema
                 .GroupBy(r => new { r.SchemaName, r.TableName })
                 .Select(g => new
@@ -100,32 +135,105 @@ namespace LibreriaPerSql.Services
                     }).ToList()
                 });
 
-            // Serializzazione che rispetta i null (se Description manca, il campo viene omesso o messo a null)
-            var JsonResult = JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
+            return JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
             {
                 WriteIndented = false,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             });
-
-            var cacheOptions = new MemoryCacheEntryOptions()
-                .SetAbsoluteExpiration(TimeSpan.FromHours(1))
-                .SetPriority(CacheItemPriority.High);
-            _cache.Set(cacheKey, JsonResult, cacheOptions);
-
-            return JsonResult;
         }
 
-        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null)
+        public async Task UpsertTableEmbeddingsAsync(IEnumerable<TableEmbeddingDTO> tables)
         {
-            ArgumentNullException.ThrowIfNullOrEmpty(sql);
+            if (tables == null || !tables.Any()) return;
+
             using var connection = CreateConnection();
+            await connection.OpenAsync();
+
+            // Inizia la "bolla di sicurezza"
+            using var transaction = connection.BeginTransaction();
+
             try
             {
-                return await connection.QueryAsync<T>(sql, parameters);
+                // 1. Creazione Tabella Idempotente (se non esiste, la crea)
+                // Aggiunta colonna [JsonSchema] per non doverlo ricalcolare in futuro
+                string createTableSql = @"
+                    IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
+                    BEGIN
+                        CREATE TABLE [dbo].[AI_SchemaCache] (
+                            [TableName] NVARCHAR(255) PRIMARY KEY,
+                            [Description] NVARCHAR(MAX),
+                            [JsonSchema] NVARCHAR(MAX),       -- Cache del JSON per il prompt
+                            [VectorData] VARBINARY(MAX),
+                            [SchemaHash] NVARCHAR(64),        -- Hash per verificare cambiamenti
+                            [LastUpdated] DATETIME DEFAULT GETDATE()
+                        );
+                    END";
+
+                await ExecuteCommandAsync(createTableSql, transaction: transaction);
+
+                // 2. Query MERGE "Intelligente"
+                // Aggiorna SOLO se l'hash è diverso. Questo evita scritture inutili su disco.
+                string mergeSql = @"
+                    MERGE INTO [dbo].[AI_SchemaCache] AS target
+                    USING (VALUES (@TableName, @Description, @JsonSchema, @VectorData, @SchemaHash)) 
+                           AS source (TableName, Description, JsonSchema, VectorData, SchemaHash)
+                    ON target.TableName = source.TableName
+                    
+                    WHEN MATCHED AND (target.SchemaHash <> source.SchemaHash OR target.SchemaHash IS NULL) THEN
+                        UPDATE SET 
+                            Description = source.Description,
+                            JsonSchema = source.JsonSchema,
+                            VectorData = source.VectorData,
+                            SchemaHash = source.SchemaHash,
+                            LastUpdated = GETDATE()
+
+                    WHEN NOT MATCHED THEN
+                        INSERT (TableName, Description, JsonSchema, VectorData, SchemaHash, LastUpdated)
+                        VALUES (source.TableName, source.Description, source.JsonSchema, source.VectorData, source.SchemaHash, GETDATE());";
+
+                // 3. Prepariamo i dati calcolando l'Hash MD5/SHA256 della descrizione
+                // Così se la descrizione della tabella non è cambiata, l'hash è uguale e SQL Server salta l'update.
+                var dataToUpsert = tables.Select(t => new
+                {
+                    t.TableName,
+                    t.Description,
+                    t.JsonSchema,
+                    t.VectorData,
+                    SchemaHash = ComputeHash(t.Description + t.JsonSchema) // Hash combinato per sicurezza
+                });
+
+                await ExecuteCommandAsync(mergeSql, dataToUpsert, transaction: transaction);
+
+                await transaction.CommitAsync();
             }
             catch (Exception ex)
             {
-                throw new Exception(ex.Message, ex);
+                // In caso di errore, annulla tutte le operazioni
+                try
+                {
+                    await transaction.RollbackAsync();
+                }
+                catch { }
+                throw new Exception($"Error during upsert operation: {ex.Message}", ex);
+            }
+        }
+
+        private static string ComputeHash(string input)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(input)) return string.Empty;
+
+                using (var sha = SHA256.Create())
+                {
+                    byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+                    return Convert.ToHexString(bytes);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Warning] Hash fallito: {ex.Message}");
+                return Guid.NewGuid().ToString();
             }
         }
     }
