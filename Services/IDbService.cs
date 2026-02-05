@@ -12,5 +12,7 @@ namespace LibreriaPerSql.Services
         Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude);
         Task UpsertTableEmbeddingsAsync(IEnumerable<TableEmbeddingDTO> tables);
 
+        Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync();
+
     }
 }

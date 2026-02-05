@@ -101,20 +101,26 @@ namespace LibreriaPerSql.Services
             }
         }
 
-        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
+        public async Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync()
+        {
+            string sql = "SELECT TableName, Description, JsonSchema, VectorData FROM [dbo].[AI_SchemaCache]";
+            return await ExecuteQueryAsync<TableEmbeddingDTO>(sql);
+        }
+
+        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? blackList)
         {
             var schemaQuery = _scriptSchemaSql.Value;
 
-            if (tablesToInclude != null && tablesToInclude.Any())
+            if (blackList != null && blackList.Any())
             {
-                schemaQuery += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
+                schemaQuery += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) NOT IN @Tables";
             }
             schemaQuery += "\nORDER BY t.name, c.column_id;";
 
             IEnumerable<RawSchemaDTO> rawSchema;
             try
             {
-                rawSchema = await ExecuteQueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = tablesToInclude });
+                rawSchema = await ExecuteQueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = blackList });
             }
             catch (SqlException ex)
             {
