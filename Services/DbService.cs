@@ -27,11 +27,11 @@ namespace LibreriaPerSql.Services
 
             // Prende tutte le risorse incorporate e cerca quella che finisce con il nome del file (ignora il namespace)
             var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(embeddedSqlName));
-            if (resourceName == null) throw new FileNotFoundException($"Embedded file {embeddedSqlName} not founded");
+            if (resourceName == null) throw new FileNotFoundException($"File embedded {embeddedSqlName} non trovato");
 
             // Apre lo stream della risorsa incorporata 
             using Stream? stream = assembly.GetManifestResourceStream(resourceName);
-            if (stream == null) throw new InvalidOperationException($"Found the name '{resourceName}', but the stream is null. Something is wrong in loading the resource.");
+            if (stream == null) throw new InvalidOperationException($"Risorsa trovata '{resourceName}', ma lo stream è nullo.");
 
             // Reader per leggere e ritornare il contenuto della risorsa come stringa 
             using StreamReader reader = new(stream);
@@ -58,7 +58,7 @@ namespace LibreriaPerSql.Services
             }
             catch (SqlException ex)
             {
-                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                throw new Exception($"Errore in fase di esecuzione query: {ex.Message}", ex);
             }
             catch (Exception ex)
             {
@@ -78,7 +78,7 @@ namespace LibreriaPerSql.Services
                 }
                 catch (SqlException ex)
                 {
-                    throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                    throw new Exception($"Errore nell'esecuzione del comando sql (transazione): {ex.Message}", ex);
                 }
                 catch (Exception ex)
                 {
@@ -93,7 +93,7 @@ namespace LibreriaPerSql.Services
             }
             catch (SqlException ex)
             {
-                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                throw new Exception($"Errore nell'esecuzione del comando sql: {ex.Message}", ex);
             }
             catch (Exception ex)
             {
@@ -124,7 +124,7 @@ namespace LibreriaPerSql.Services
             }
             catch (SqlException ex)
             {
-                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                throw new Exception($"Errore durante la creazione dello schema: {ex.Message}", ex);
             }
 
             var schemaStructured = rawSchema
@@ -155,13 +155,12 @@ namespace LibreriaPerSql.Services
             using var connection = CreateConnection();
             await connection.OpenAsync();
 
-            // Inizia la "bolla di sicurezza"
+            // "bolla di sicurezza"
             using var transaction = connection.BeginTransaction();
 
             try
             {
-                // 1. Creazione Tabella Idempotente (se non esiste, la crea)
-                // Aggiunta colonna [JsonSchema] per non doverlo ricalcolare in futuro
+                // Creazione Tabella Idempotente (se non esiste, la crea)
                 string createTableSql = @"
                     IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
                     BEGIN
@@ -177,7 +176,6 @@ namespace LibreriaPerSql.Services
 
                 await ExecuteCommandAsync(createTableSql, transaction: transaction);
 
-                // 2. Query MERGE "Intelligente"
                 // Aggiorna SOLO se l'hash è diverso. Questo evita scritture inutili su disco.
                 string mergeSql = @"
                     MERGE INTO [dbo].[AI_SchemaCache] AS target
@@ -197,8 +195,7 @@ namespace LibreriaPerSql.Services
                         INSERT (TableName, Description, JsonSchema, VectorData, SchemaHash, LastUpdated)
                         VALUES (source.TableName, source.Description, source.JsonSchema, source.VectorData, source.SchemaHash, GETDATE());";
 
-                // 3. Prepariamo i dati calcolando l'Hash MD5/SHA256 della descrizione
-                // Così se la descrizione della tabella non è cambiata, l'hash è uguale e SQL Server salta l'update.
+                // Se la descrizione della tabella non è cambiata, l'hash è uguale e SQL Server salta l'update.
                 var dataToUpsert = tables.Select(t => new
                 {
                     t.TableName,
@@ -220,7 +217,7 @@ namespace LibreriaPerSql.Services
                     await transaction.RollbackAsync();
                 }
                 catch { }
-                throw new Exception($"Error during upsert operation: {ex.Message}", ex);
+                throw new Exception($"Errore in fase di upsert: {ex.Message}", ex);
             }
         }
 
