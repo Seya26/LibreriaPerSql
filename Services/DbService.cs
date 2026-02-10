@@ -2,6 +2,7 @@
 using LibreriaPerSql.Configurations;
 using LibreriaPerSql.DTO;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Data;
 using System.Reflection;
@@ -15,6 +16,7 @@ namespace LibreriaPerSql.Services
     public class DbService : IDbService
     {
         private readonly DbConfig _config;
+        private readonly ILogger<DbService> _logger;
 
         // Variabile che tramite lambda function estrae lo script sql incorporato per estrapolare lo schema di un db
         // Lazy<T> permette di caricare la risorsa solo alla prima chiamata quando è realmente necessaria, senno restituisce (le chiamate successive) il valore memorizzato (caching)
@@ -38,9 +40,10 @@ namespace LibreriaPerSql.Services
             return reader.ReadToEnd();
         });
 
-        public DbService(IOptions<DbConfig> config)
+        public DbService(IOptions<DbConfig> config, ILogger<DbService> logger)
         {
             _config = config.Value;
+            _logger = logger;
         }
 
         private SqlConnection CreateConnection()
@@ -58,11 +61,13 @@ namespace LibreriaPerSql.Services
             }
             catch (SqlException ex)
             {
-                throw new Exception($"Errore in fase di esecuzione query: {ex.Message}", ex);
+                _logger.LogError(ex, $"Errore in fase di esecuzione query: {ex.Message}");
+                throw;
             }
             catch (Exception ex)
             {
-                throw new Exception(ex.Message, ex);
+                _logger.LogError(ex, $"Errore in fase di esecuzione query: {ex.Message}");
+                throw;
             }
         }
 
@@ -78,7 +83,8 @@ namespace LibreriaPerSql.Services
                 }
                 catch (SqlException ex)
                 {
-                    throw new Exception($"Errore nell'esecuzione del comando sql (transazione): {ex.Message}", ex);
+                    _logger.LogError(ex, $"Errore in fase di esecuzione del comando sql (transazione): {ex.Message}");
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -155,12 +161,10 @@ namespace LibreriaPerSql.Services
             using var connection = CreateConnection();
             await connection.OpenAsync();
 
-            // "bolla di sicurezza"
             using var transaction = connection.BeginTransaction();
 
             try
             {
-                // Creazione Tabella Idempotente (se non esiste, la crea)
                 string createTableSql = @"
                     IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
                     BEGIN
@@ -176,7 +180,6 @@ namespace LibreriaPerSql.Services
 
                 await ExecuteCommandAsync(createTableSql, transaction: transaction);
 
-                // Aggiorna SOLO se l'hash è diverso. Questo evita scritture inutili su disco.
                 string mergeSql = @"
                     MERGE INTO [dbo].[AI_SchemaCache] AS target
                     USING (VALUES (@TableName, @Description, @JsonSchema, @VectorData, @SchemaHash)) 
@@ -195,7 +198,6 @@ namespace LibreriaPerSql.Services
                         INSERT (TableName, Description, JsonSchema, VectorData, SchemaHash, LastUpdated)
                         VALUES (source.TableName, source.Description, source.JsonSchema, source.VectorData, source.SchemaHash, GETDATE());";
 
-                // Se la descrizione della tabella non è cambiata, l'hash è uguale e SQL Server salta l'update.
                 var dataToUpsert = tables.Select(t => new
                 {
                     t.TableName,
@@ -207,6 +209,19 @@ namespace LibreriaPerSql.Services
 
                 await ExecuteCommandAsync(mergeSql, dataToUpsert, transaction: transaction);
 
+                if (dataToUpsert.Any())
+                {
+                    var activeTableNames = dataToUpsert.Select(t => t.TableName).ToList();
+
+                    string deleteSql = "DELETE FROM [dbo].[AI_SchemaCache] WHERE TableName NOT IN @ActiveTables";
+
+                    await ExecuteCommandAsync(deleteSql, new { ActiveTables = activeTableNames }, transaction: transaction);
+                }
+                else
+                {
+                    await ExecuteCommandAsync("TRUNCATE TABLE [dbo].[AI_SchemaCache]", transaction: transaction);
+                }
+
                 await transaction.CommitAsync();
             }
             catch (Exception ex)
@@ -217,27 +232,19 @@ namespace LibreriaPerSql.Services
                     await transaction.RollbackAsync();
                 }
                 catch { }
-                throw new Exception($"Errore in fase di upsert: {ex.Message}", ex);
+                _logger.LogError(ex, $"Errore durante l'upsert delle embedding: {ex.Message}");
+                throw;
             }
         }
 
-        private static string ComputeHash(string input)
+        private string ComputeHash(string input)
         {
-            try
-            {
-                if (string.IsNullOrEmpty(input)) return string.Empty;
+            if (string.IsNullOrEmpty(input)) return string.Empty;
 
-                using (var sha = SHA256.Create())
-                {
-                    byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
-                    return Convert.ToHexString(bytes);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Warning] Hash fallito: {ex.Message}");
-                return Guid.NewGuid().ToString();
-            }
+            byte[] inputBytes = Encoding.UTF8.GetBytes(input);
+            byte[] hashBytes = SHA256.HashData(inputBytes);
+
+            return Convert.ToHexString(hashBytes);
         }
     }
 }
