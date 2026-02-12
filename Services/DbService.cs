@@ -19,7 +19,7 @@ namespace LibreriaPerSql.Services
         private readonly ILogger<DbService> _logger;
 
         // Lazy loading dello script SQL embedded.
-        private static readonly Lazy<string> _scriptSchemaSql = new(() => LoadEmbeddedSql("ScriptGetDatabaseSchema.sql"));
+        private static readonly Lazy<string> _scriptSchemaSql = new(() => LoadEmbeddedSql("LibreriaPerSql.Resources.ScriptSQL.ScriptGetDatabaseSchema.sql"));
 
         public DbService(IOptions<DbConfig> config, ILogger<DbService> logger)
         {
