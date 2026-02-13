@@ -47,23 +47,23 @@ namespace LibreriaPerSql.Services
 
         private SqlConnection CreateConnection() => new SqlConnection(_config.ConnectionString);
 
-        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
-        {
-            ArgumentException.ThrowIfNullOrEmpty(sql);
-
-            using var connection = CreateConnection();
-            var command = new CommandDefinition(sql, parameters, cancellationToken: ct);
-
-            try
+            public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
             {
-                return await connection.QueryAsync<T>(command);
+                ArgumentException.ThrowIfNullOrEmpty(sql);
+
+                using var connection = CreateConnection();
+                var command = new CommandDefinition(sql, parameters, cancellationToken: ct);
+
+                try
+                {
+                    return (await connection.QueryAsync<T>(command: command)).ToList();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Errore esecuzione query. SQL: {Sql}", sql);
+                    throw; 
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Errore esecuzione query. SQL: {Sql}", sql);
-                throw; 
-            }
-        }
 
         public async Task<int> ExecuteCommandAsync(string sql, object? parameters = null, IDbTransaction? transaction = null, CancellationToken ct = default)
         {
@@ -75,11 +75,11 @@ namespace LibreriaPerSql.Services
             {
                 if (transaction != null)
                 {
-                    return await transaction.Connection!.ExecuteAsync(command);
+                    return await transaction.Connection!.ExecuteAsync(command: command);
                 }
 
                 using var connection = CreateConnection();
-                return await connection.ExecuteAsync(command);
+                return await connection.ExecuteAsync(command: command);
             }
             catch (Exception ex)
             {
@@ -92,6 +92,12 @@ namespace LibreriaPerSql.Services
         {
             const string sql = "SELECT TableName, Description, JsonSchema, VectorData FROM [dbo].[AI_SchemaCache]";
             return await ExecuteQueryAsync<TableEmbeddingDTO>(sql, ct: CancellationToken.None);
+        }
+
+        public async Task<int> CountTableEmbeddingsAsync()
+        {
+            const string sql = "SELECT COUNT(*) FROM [dbo].[AI_SchemaCache]";
+            return await ExecuteCommandAsync(sql, ct: CancellationToken.None);
         }
 
         public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? blackList, CancellationToken ct = default)

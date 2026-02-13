@@ -41,5 +41,11 @@ namespace LibreriaPerSql.Services
         /// </summary>
         /// <returns> Collezione di oggetti TableEmbeddingDTO contenenti le informazioni sulle tabelle e i loro embedding (<see cref="IEnumerable{TableEmbeddingDTO}"/>). </returns>
         Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync();
+
+        /// <summary>
+        /// Metodo utile per il caching del hash del database, per evitare di eseguire operazioni di embedding quando non è necessario.
+        /// </summary>
+        /// <returns>Numero di righe presenti nel db</returns>
+        Task<int> CountTableEmbeddingsAsync();
     }
 }
