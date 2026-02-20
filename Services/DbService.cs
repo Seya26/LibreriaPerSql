@@ -33,11 +33,7 @@ namespace LibreriaPerSql.Services
         private static string LoadEmbeddedSql(string fileName)
         {
             var assembly = Assembly.GetExecutingAssembly();
-            var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(fileName));
-
-            if (resourceName == null)
-                throw new FileNotFoundException($"Risorsa embedded '{fileName}' non trovata.");
-
+            var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(fileName)) ?? throw new FileNotFoundException($"Risorsa embedded '{fileName}' non trovata.");
             using var stream = assembly.GetManifestResourceStream(resourceName)
                 ?? throw new InvalidOperationException($"Risorsa '{resourceName}' trovata ma lo stream è nullo.");
 
@@ -45,7 +41,7 @@ namespace LibreriaPerSql.Services
             return reader.ReadToEnd();
         }
 
-        private SqlConnection CreateConnection() => new SqlConnection(_config.ConnectionString);
+        private SqlConnection CreateConnection() => new(_config.ConnectionString);
 
             public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
             {
@@ -83,7 +79,7 @@ namespace LibreriaPerSql.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Errore esecuzione comando. SQL: {sql}");
+                _logger.LogError(ex, "Errore esecuzione comando. SQL: {query}", sql);
                 throw;
             }
         }
@@ -210,7 +206,7 @@ namespace LibreriaPerSql.Services
         /// <param name="transaction">Comando per la transazione sicura di prova (<see cref="IDbTransaction"/>)</param>
         /// <param name="ct">Cancellation Token</param>
         /// <returns>Task per il completamento del metodo</returns>
-        private async Task EnsureCacheTableExistsAsync(IDbConnection connection, IDbTransaction transaction, CancellationToken ct)
+        private static async Task EnsureCacheTableExistsAsync(IDbConnection connection, IDbTransaction transaction, CancellationToken ct)
         {
             const string createTableSql = @"
                 IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
