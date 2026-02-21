@@ -43,23 +43,24 @@ namespace LibreriaPerSql.Services
 
         private SqlConnection CreateConnection() => new(_config.ConnectionString);
 
-            public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
+        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(sql);
+            var contextVariables = parameters == null ? null : new DynamicParameters(parameters);
+            
+            using var connection = CreateConnection();
+            var command = new CommandDefinition(sql, contextVariables, cancellationToken: ct);
+
+            try
             {
-                ArgumentException.ThrowIfNullOrEmpty(sql);
-
-                using var connection = CreateConnection();
-                var command = new CommandDefinition(sql, parameters, cancellationToken: ct);
-
-                try
-                {
-                    return (await connection.QueryAsync<T>(command: command)).ToList();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Errore esecuzione query. SQL: {Sql}", sql);
-                    throw; 
-                }
+                return (await connection.QueryAsync<T>(command: command)).ToList();
             }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Errore esecuzione query. SQL: {Sql}", sql);
+                throw;
+            }
+        }
 
         public async Task<int> ExecuteCommandAsync(string sql, object? parameters = null, IDbTransaction? transaction = null, CancellationToken ct = default)
         {
