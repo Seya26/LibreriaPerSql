@@ -87,12 +87,14 @@ namespace LibreriaPerSql.Services
 
         public async Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync()
         {
+            await EnsureCacheTableExistsNoTransactionAsync();
             const string sql = "SELECT TableName, Description, JsonSchema, VectorData FROM [dbo].[AI_SchemaCache]";
             return await ExecuteQueryAsync<TableEmbeddingDTO>(sql, ct: CancellationToken.None);
         }
 
         public async Task<int> CountTableEmbeddingsAsync()
         {
+            await EnsureCacheTableExistsNoTransactionAsync();
             const string sql = "SELECT COUNT(*) FROM [dbo].[AI_SchemaCache]";
             return await ExecuteCommandAsync(sql, ct: CancellationToken.None);
         }
@@ -224,6 +226,24 @@ namespace LibreriaPerSql.Services
 
             var command = new CommandDefinition(createTableSql, transaction: transaction, cancellationToken: ct);
             await connection.ExecuteAsync(command);
+        }
+
+        private async Task EnsureCacheTableExistsNoTransactionAsync(CancellationToken ct = default)
+        {
+            const string createTableSql = @"
+        IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
+        BEGIN
+            CREATE TABLE [dbo].[AI_SchemaCache] (
+                [TableName] NVARCHAR(255) PRIMARY KEY,
+                [Description] NVARCHAR(MAX),
+                [JsonSchema] NVARCHAR(MAX),
+                [VectorData] VARBINARY(MAX),
+                [SchemaHash] NVARCHAR(64),
+                [LastUpdated] DATETIME DEFAULT GETDATE()
+            );
+        END";
+
+            await ExecuteCommandAsync(createTableSql, ct: ct);
         }
 
 
