@@ -13,7 +13,7 @@ namespace LibreriaPerSql.Extensions
             services.Configure<DbConfig>(dbSection);
             var dbConfig = dbSection.Get<DbConfig>();
 
-            if (dbConfig == null) throw new InvalidOperationException("DbConfig section is missing in the configuration.");
+            if (dbConfig == null) throw new InvalidOperationException("La sezione delle configurazione del DB (DbConfig) risulta mancante.");
             ArgumentNullException.ThrowIfNullOrEmpty(dbConfig.ProviderSQL);
             ArgumentNullException.ThrowIfNullOrEmpty(dbConfig.ConnectionString);
 

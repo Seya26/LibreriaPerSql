@@ -2,9 +2,12 @@
 using LibreriaPerSql.Configurations;
 using LibreriaPerSql.DTO;
 using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Data;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -13,79 +16,113 @@ namespace LibreriaPerSql.Services
     public class DbService : IDbService
     {
         private readonly DbConfig _config;
-        private readonly IMemoryCache _cache;
+        private readonly ILogger<DbService> _logger;
 
-        // Variabile che tramite lambda function estrae lo script sql incorporato per estrapolare lo schema di un db
-        // Lazy<T> permette di caricare la risorsa solo alla prima chiamata quando è realmente necessaria, senno restituisce (le chiamate successive) il valore memorizzato (caching)
-        // Static perchè lo script è lo stesso per tutte le istanze di DbService (non cambia mai)
-        private static readonly Lazy<string> _scriptSchemaSql = new Lazy<string>(() =>
-        {
-            const string embeddedSqlName = "ScriptGetDatabaseSchema.sql";
-            // Determina l'assembly che contiene la risorsa incorporata
-            var assembly = Assembly.GetExecutingAssembly();
+        // Lazy loading dello script SQL embedded.
+        private static readonly Lazy<string> _scriptSchemaSql = new(() => LoadEmbeddedSql("LibreriaPerSql.Resources.ScriptSQL.ScriptGetDatabaseSchema.sql"));
 
-            // Prende tutte le risorse incorporate e cerca quella che finisce con il nome del file (ignora il namespace)
-            var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(embeddedSqlName));
-            if (resourceName == null) throw new FileNotFoundException($"Embedded file {embeddedSqlName} not founded");
-
-            // Apre lo stream della risorsa incorporata 
-            using Stream? stream = assembly.GetManifestResourceStream(resourceName);
-            if (stream == null) throw new InvalidOperationException($"Found the name '{resourceName}', but the stream is null. Something is wrong in loading the resource.");
-
-            // Reader per leggere e ritornare il contenuto della risorsa come stringa 
-            using StreamReader reader = new(stream);
-            return reader.ReadToEnd();
-        });
-
-        public DbService(IOptions<DbConfig> config, IMemoryCache cache)
+        public DbService(IOptions<DbConfig> config, ILogger<DbService> logger)
         {
             _config = config.Value;
-            _cache = cache;
+            _logger = logger;
         }
 
-        private SqlConnection CreateConnection()
+        /// <summary>
+        /// Carica una risorsa embedded (script SQL) in modo statico e thread-safe.
+        /// </summary>
+        private static string LoadEmbeddedSql(string fileName)
         {
-            return new SqlConnection(_config.ConnectionString);
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceName = assembly.GetManifestResourceNames().FirstOrDefault(str => str.EndsWith(fileName)) ?? throw new FileNotFoundException($"Risorsa embedded '{fileName}' non trovata.");
+            using var stream = assembly.GetManifestResourceStream(resourceName)
+                ?? throw new InvalidOperationException($"Risorsa '{resourceName}' trovata ma lo stream è nullo.");
+
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
         }
 
-        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? tablesToInclude)
+        private SqlConnection CreateConnection() => new(_config.ConnectionString);
+
+        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default)
         {
-            //Chiave per la cache che identifica se la whitelist è cambiata e quindi di riscaricare lo schema o di utilizzare quello presente nella cache
-            // Se ce una whitelist, gli crea un nome (es.. schema_Students_Courses) per permettere di controllare se esiste nella cache lo stesso schema (esso viene poi orderBy alfabeticamente per evitare problemi di ordine (! schema_Courses_Students...sono la stessa cosa)
-            // se invece whitelist nulla, allora etichetta con "Schema_All_Tables" cosi prende dalla cache la variabile con la giusta etichetta
-            string cacheKey = tablesToInclude != null && tablesToInclude.Any()
-                ? $"Schema_{string.Join("_", tablesToInclude.OrderBy(x => x))}"
-                : "Schema_All_Tables";
+            ArgumentException.ThrowIfNullOrEmpty(sql);
+            var contextVariables = parameters == null ? null : new DynamicParameters(parameters);
+            
+            using var connection = CreateConnection();
+            var command = new CommandDefinition(sql, contextVariables, cancellationToken: ct);
 
-            //Restituiamo subito lo schema se gia presente con l'etichetta che gli abbiamo dato prima
-            //Se ce, la restituisce 'out' in cachedJson
-            if (_cache.TryGetValue(cacheKey, out string? cachedJson))
+            try
             {
-                return cachedJson!;
+                return (await connection.QueryAsync<T>(command: command)).ToList();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Errore esecuzione query. SQL: {Sql}", sql);
+                throw;
+            }
+        }
+
+        public async Task<int> ExecuteCommandAsync(string sql, object? parameters = null, IDbTransaction? transaction = null, CancellationToken ct = default)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(sql);
+
+            var command = new CommandDefinition(sql, parameters, transaction: transaction, cancellationToken: ct);
+
+            try
+            {
+                if (transaction != null)
+                {
+                    return await transaction.Connection!.ExecuteAsync(command: command);
+                }
+
+                using var connection = CreateConnection();
+                return await connection.ExecuteAsync(command: command);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Errore esecuzione comando. SQL: {query}", sql);
+                throw;
+            }
+        }
+
+        public async Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync()
+        {
+            await EnsureCacheTableExistsNoTransactionAsync();
+            const string sql = "SELECT TableName, Description, JsonSchema, VectorData FROM [dbo].[AI_SchemaCache]";
+            return await ExecuteQueryAsync<TableEmbeddingDTO>(sql, ct: CancellationToken.None);
+        }
+
+        public async Task<int> CountTableEmbeddingsAsync()
+        {
+            await EnsureCacheTableExistsNoTransactionAsync();
+            const string sql = "SELECT COUNT(*) FROM [dbo].[AI_SchemaCache]";
+            return await ExecuteCommandAsync(sql, ct: CancellationToken.None);
+        }
+
+        public async Task<string> GetSchemaJsonAsync(IEnumerable<string>? blackList, CancellationToken ct = default)
+        {
+            var schemaQuery = new StringBuilder(_scriptSchemaSql.Value);
+            var parameters = new DynamicParameters();
+
+            if (blackList != null && blackList.Any())
+            {
+                schemaQuery.AppendLine("\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) NOT IN @Tables");
+                parameters.Add("Tables", blackList);
             }
 
-            var schemaQuery = _scriptSchemaSql.Value;
-
-            string queryFilter = "";
-            if (tablesToInclude != null && tablesToInclude.Any())
-            {
-                queryFilter += "\nWHERE (QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)) IN @Tables";
-            }
-            queryFilter += "\nORDER BY t.name, c.column_id;";
-            //Aggiungo il filtro per le tabelle
-            schemaQuery += queryFilter;
+            schemaQuery.AppendLine("\nORDER BY t.name, c.column_id;");
 
             IEnumerable<RawSchemaDTO> rawSchema;
             try
             {
-                using var connection = CreateConnection();
-                rawSchema = await connection.QueryAsync<RawSchemaDTO>(schemaQuery, new { Tables = tablesToInclude });
+                rawSchema = await ExecuteQueryAsync<RawSchemaDTO>(schemaQuery.ToString(), parameters, ct);
             }
-            catch (SqlException ex)
+            catch (Exception ex)
             {
-                throw new Exception($"Error during DB reading: {ex.Message}", ex);
+                _logger.LogError(ex, "Errore durante il recupero dello schema raw.");
+                throw;
             }
-            // Trasformazione in memoria per creare la gerarchia Tabella -> Colonne
+
             var schemaStructured = rawSchema
                 .GroupBy(r => new { r.SchemaName, r.TableName })
                 .Select(g => new
@@ -100,33 +137,129 @@ namespace LibreriaPerSql.Services
                     }).ToList()
                 });
 
-            // Serializzazione che rispetta i null (se Description manca, il campo viene omesso o messo a null)
-            var JsonResult = JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
+            return JsonSerializer.Serialize(schemaStructured, new JsonSerializerOptions
             {
                 WriteIndented = false,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             });
-
-            var cacheOptions = new MemoryCacheEntryOptions()
-                .SetAbsoluteExpiration(TimeSpan.FromHours(1))
-                .SetPriority(CacheItemPriority.High);
-            _cache.Set(cacheKey, JsonResult, cacheOptions);
-
-            return JsonResult;
         }
 
-        public async Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null)
+        public async Task UpsertTableEmbeddingsAsync(IEnumerable<TableEmbeddingDTO> tables, CancellationToken ct = default)
         {
-            ArgumentNullException.ThrowIfNullOrEmpty(sql);
+            if (tables == null || !tables.Any()) return;
+
             using var connection = CreateConnection();
+            await connection.OpenAsync(ct);
+            using var transaction = connection.BeginTransaction();
+
             try
             {
-                return await connection.QueryAsync<T>(sql, parameters);
+                await EnsureCacheTableExistsAsync(connection, transaction, ct);
+
+                var dataToUpsert = tables.Select(t => new
+                {
+                    t.TableName,
+                    t.Description,
+                    t.JsonSchema,
+                    t.VectorData,
+                    SchemaHash = ComputeHash(t.Description + t.JsonSchema)
+                }).ToList();
+
+                const string mergeSql = @"
+                    MERGE INTO [dbo].[AI_SchemaCache] AS target
+                    USING (VALUES (@TableName, @Description, @JsonSchema, @VectorData, @SchemaHash)) 
+                           AS source (TableName, Description, JsonSchema, VectorData, SchemaHash)
+                    ON target.TableName = source.TableName
+                    
+                    WHEN MATCHED AND (target.SchemaHash <> source.SchemaHash OR target.SchemaHash IS NULL) THEN
+                        UPDATE SET 
+                            Description = source.Description,
+                            JsonSchema = source.JsonSchema,
+                            VectorData = source.VectorData,
+                            SchemaHash = source.SchemaHash,
+                            LastUpdated = GETDATE()
+
+                    WHEN NOT MATCHED THEN
+                        INSERT (TableName, Description, JsonSchema, VectorData, SchemaHash, LastUpdated)
+                        VALUES (source.TableName, source.Description, source.JsonSchema, source.VectorData, source.SchemaHash, GETDATE());";
+
+                var cmdMerge = new CommandDefinition(mergeSql, dataToUpsert, transaction, cancellationToken: ct);
+                await connection.ExecuteAsync(cmdMerge);
+
+                var activeTableNames = dataToUpsert.Select(t => t.TableName).ToList();
+                const string deleteSql = "DELETE FROM [dbo].[AI_SchemaCache] WHERE TableName NOT IN @ActiveTables";
+
+                var cmdDelete = new CommandDefinition(deleteSql, new { ActiveTables = activeTableNames }, transaction, cancellationToken: ct);
+                await connection.ExecuteAsync(cmdDelete);
+
+                await transaction.CommitAsync(ct);
             }
             catch (Exception ex)
             {
-                throw new Exception(ex.Message, ex);
+                _logger.LogError(ex, "Errore durante l'upsert delle embedding (Rollback in corso).");
+                try { await transaction.RollbackAsync(ct); } catch { }
+                throw;
             }
+        }
+
+        /// <summary>
+        /// Metodo per assicurarsi che la tabella di cache esista prima di tentare qualsiasi operazione di upsert. 
+        /// </summary>
+        /// <param name="connection">Connessione al database (<see cref="IDbConnection"/>) </param>
+        /// <param name="transaction">Comando per la transazione sicura di prova (<see cref="IDbTransaction"/>)</param>
+        /// <param name="ct">Cancellation Token</param>
+        /// <returns>Task per il completamento del metodo</returns>
+        private static async Task EnsureCacheTableExistsAsync(IDbConnection connection, IDbTransaction transaction, CancellationToken ct)
+        {
+            const string createTableSql = @"
+                IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE [dbo].[AI_SchemaCache] (
+                        [TableName] NVARCHAR(255) PRIMARY KEY,
+                        [Description] NVARCHAR(MAX),
+                        [JsonSchema] NVARCHAR(MAX),
+                        [VectorData] VARBINARY(MAX),
+                        [SchemaHash] NVARCHAR(64),
+                        [LastUpdated] DATETIME DEFAULT GETDATE()
+                    );
+                END";
+
+            var command = new CommandDefinition(createTableSql, transaction: transaction, cancellationToken: ct);
+            await connection.ExecuteAsync(command);
+        }
+
+        private async Task EnsureCacheTableExistsNoTransactionAsync(CancellationToken ct = default)
+        {
+            const string createTableSql = @"
+        IF OBJECT_ID('[dbo].[AI_SchemaCache]', 'U') IS NULL
+        BEGIN
+            CREATE TABLE [dbo].[AI_SchemaCache] (
+                [TableName] NVARCHAR(255) PRIMARY KEY,
+                [Description] NVARCHAR(MAX),
+                [JsonSchema] NVARCHAR(MAX),
+                [VectorData] VARBINARY(MAX),
+                [SchemaHash] NVARCHAR(64),
+                [LastUpdated] DATETIME DEFAULT GETDATE()
+            );
+        END";
+
+            await ExecuteCommandAsync(createTableSql, ct: ct);
+        }
+
+
+        /// <summary>
+        /// Metodo per calcolare un hash (SHA256) basato sulla descrizione e lo schema JSON di una tabella.
+        /// </summary>
+        /// <param name="input">stringa da calcolare (<see cref="string"/>)</param>
+        /// <returns>stringa calcolata su base SHA256 (<see cref="string"/>) </returns>
+        private static string ComputeHash(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return string.Empty;
+
+            byte[] inputBytes = Encoding.UTF8.GetBytes(input);
+            byte[] hashBytes = SHA256.HashData(inputBytes);
+
+            return Convert.ToHexString(hashBytes);
         }
     }
 }
