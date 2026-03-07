@@ -78,10 +78,16 @@ namespace LibreriaPerSql.Executors
         /// </summary>
         private static void ValidateMqlQuery(MqlQueryDTO mql)
         {
-            ArgumentException.ThrowIfNullOrEmpty(mql.Collection,
-                "MqlQueryDTO.Collection è obbligatorio.");
+            if (string.IsNullOrEmpty(mql.Collection))
+                throw new ArgumentException(
+                    "MqlQueryDTO.Collection è obbligatorio ma è null o vuoto. " +
+                    "Verificare che la risposta AI contenga il campo 'collection'.");
 
-            var op = mql.Operation?.ToLowerInvariant();
+            // Operation opzionale: default a "find" se mancante
+            if (string.IsNullOrEmpty(mql.Operation))
+                mql.Operation = "find";
+
+            var op = mql.Operation.ToLowerInvariant();
 
             // Blocca operazioni di scrittura anche se generate erroneamente dall'AI
             string[] forbidden = ["insert", "update", "delete", "drop", "replace"];
@@ -123,7 +129,7 @@ namespace LibreriaPerSql.Executors
                 foreach (var (key, value) in paramDict)
                 {
                     // Sostituisce la stringa "@NomeParametro" (con le virgolette incluse) col valore tipizzato
-                    filterJson = filterJson.Replace($"\"@{key}\"", JsonSerializer.Serialize(value));
+                    filterJson = filterJson.Replace($"\"@{key}\"", System.Text.Json.JsonSerializer.Serialize(value));
                 }
                 // Ricrea il filtro dal JSON aggiornato
                 mql.Filter = System.Text.Json.JsonDocument.Parse(filterJson).RootElement;
