@@ -1,51 +1,60 @@
-﻿using LibreriaPerSql.DTO;
-using System.Data;
+using LibreriaPerSql.DTO;
 
 namespace LibreriaPerSql.Services
 {
+    /// <summary>
+    /// Interfaccia pubblica per l'accesso al database in SOLA LETTURA.
+    /// 
+    /// L'utente può SOLO visualizzare e analizzare dati.
+    /// Le operazioni di scrittura (INSERT/UPDATE/DELETE) non sono esposte:
+    /// l'unica scrittura che avviene è quella interna al caching degli embedding,
+    /// gestita direttamente dagli executor senza passare da questa interfaccia.
+    /// 
+    /// Funziona sia con SQL Server che con MongoDB — il provider è trasparente
+    /// al chiamante e si configura tramite DbConfig.ProviderSQL in appsettings.json.
+    /// </summary>
     public interface IDbService
     {
         /// <summary>
-        /// Metodo per eseguire query SQL asincrone (SELECT) e restituire i risultati come collezione di oggetti del tipo specificato.
+        /// Esegue una query di SOLA LETTURA generata dall'AI e restituisce
+        /// i risultati come lista di oggetti dynamic, compatibili con
+        /// Syncfusion Grid e Charts.
+        /// 
+        /// Il parametro "query" dipende dal provider configurato:
+        ///   - SQL Server → stringa T-SQL
+        ///                  es: "SELECT nome, cognome FROM Studenti WHERE anno = 2024"
+        ///   - MongoDB    → MqlQueryDTO
+        ///                  es: new MqlQueryDTO { Collection="Studenti", Operation="find",
+        ///                                        Filter = new { anno = 2024 } }
         /// </summary>
-        /// <param name="sql">la query T-SQL da eseguire (<see cref="string"/>)</param>
-        /// <param name="parameters"> eventuali parametri da passare alla query (<see cref="object"/>)</param>
-        /// <returns>una collezione di oggetti del tipo specificato (<see cref="IEnumerable{T}"/>)</returns>
-        Task<IEnumerable<T>> ExecuteQueryAsync<T>(string sql, object? parameters = null, CancellationToken ct = default);
+        Task<IEnumerable<dynamic>> ExecuteQueryAsync(object query, object? parameters = null, CancellationToken ct = default);
 
         /// <summary>
-        /// Metodo per eseguire comandi sql asincroni (INSERT, UPDATE, DELETE).
+        /// Estrae lo schema del database come JSON strutturato.
+        /// Questo JSON viene mandato all'AI come contesto per generare le query.
+        /// 
+        ///   - SQL Server → schema preciso da sys.tables / sys.columns
+        ///   - MongoDB    → schema inferito campionando i documenti esistenti
         /// </summary>
-        /// <param name="sql">la query T-SQL da eseguire (<see cref="string"/>)</param>
-        /// <param name="parameters"> eventuali parametri da passare alla query (<see cref="object"/>)</param>
-        /// <param name="transaction">eventuale transazione da utilizzare per l'esecuzione del comando (<see cref="IDbTransaction"/>)</param>
-        /// <returns>il numero di righe interessate dall'operazione (<see cref="int"/>)</returns>
-        Task<int> ExecuteCommandAsync(string sql, object? parameters = null, IDbTransaction? transaction = null, CancellationToken ct = default);
+        Task<string> GetSchemaJsonAsync(IEnumerable<string>? blackList = null, CancellationToken ct = default);
 
         /// <summary>
-        /// Metodo per ottenere lo schema del database in formato JSON.
+        /// [USO INTERNO — LibreriaAI]
+        /// Salva o aggiorna gli embedding nella cache del database.
+        /// Non rappresenta una modifica ai dati utente.
         /// </summary>
-        /// <param name="blackList">Lista opzionale di tabelle da includere nello schema (<see cref="IEnumerable{string}"/>).</param>
-        /// <returns>Lo schema del database in formato JSON. (<see cref="string"/>)</returns>
-        Task<string> GetSchemaJsonAsync(IEnumerable<string>? blackList, CancellationToken ct = default);
+        Task UpsertEmbeddingsAsync(IEnumerable<TableEmbeddingDTO> embeddings, CancellationToken ct = default);
 
         /// <summary>
-        /// Metodo per inserire o aggiornare le rappresentazioni vettoriali delle tabelle nel database.
+        /// [USO INTERNO — LibreriaAI]
+        /// Recupera tutti gli embedding dalla cache.
         /// </summary>
-        /// <param name="tables">Collezione di oggetti TableEmbeddingDTO contenenti le informazioni sulle tabelle e i loro embedding (<see cref="IEnumerable{TableEmbeddingDTO}"/>).</param>
-        /// <param name="ct">Token di cancellazione per l'operazione asincrona.</param>
-        Task UpsertTableEmbeddingsAsync(IEnumerable<TableEmbeddingDTO> tables, CancellationToken ct = default);
+        Task<IEnumerable<TableEmbeddingDTO>> GetAllEmbeddingsAsync(CancellationToken ct = default);
 
         /// <summary>
-        /// Metodo per recuperare tutte le rappresentazioni vettoriali delle tabelle dal database.
+        /// [USO INTERNO — LibreriaAI]
+        /// Conta gli embedding in cache. Usato per decidere se ricalcolarli.
         /// </summary>
-        /// <returns> Collezione di oggetti TableEmbeddingDTO contenenti le informazioni sulle tabelle e i loro embedding (<see cref="IEnumerable{TableEmbeddingDTO}"/>). </returns>
-        Task<IEnumerable<TableEmbeddingDTO>> GetAllTableEmbeddingsAsync();
-
-        /// <summary>
-        /// Metodo utile per il caching del hash del database, per evitare di eseguire operazioni di embedding quando non è necessario.
-        /// </summary>
-        /// <returns>Numero di righe presenti nel db</returns>
-        Task<int> CountTableEmbeddingsAsync();
+        Task<int> CountEmbeddingsAsync(CancellationToken ct = default);
     }
 }
