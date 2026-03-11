@@ -345,42 +345,61 @@ namespace LibreriaPerSql.Executors
 
             foreach (var item in embeddings)
             {
-                var hash = ComputeHash(item.Description + item.JsonSchema);
+                // 1. Calcoliamo l'hash dei dati correnti
+                var currentHash = ComputeHash(item.Description + item.JsonSchema);
                 activeNames.Add(item.TableName);
 
+                // 2. Cerchiamo nel DB se esiste già la tabella e prendiamo SOLO il suo hash
+                var projection = Builders<BsonDocument>.Projection.Include("schemaHash");
+                var existingDoc = await cacheCollection
+                    .Find(Builders<BsonDocument>.Filter.Eq("_id", item.TableName))
+                    .Project(projection)
+                    .FirstOrDefaultAsync(ct);
+
+                // 3. LOGICA SMART: Se il documento esiste e l'hash è identico, non facciamo nulla
+                if (existingDoc != null &&
+                    existingDoc.Contains("schemaHash") &&
+                    existingDoc["schemaHash"].AsString == currentHash)
+                {
+                    _logger.LogInformation("Cache valida per {TableName}, salto l'aggiornamento.", item.TableName);
+                    continue;
+                }
+
+                // 4. Se arriviamo qui, l'hash è diverso o il documento è nuovo: procediamo all'Upsert
                 var doc = new BsonDocument
                 {
-                    ["_id"]         = item.TableName,
-                    ["tableName"]   = item.TableName,
+                    ["_id"] = item.TableName,
+                    ["tableName"] = item.TableName,
                     ["description"] = item.Description ?? string.Empty,
-                    ["jsonSchema"]  = item.JsonSchema ?? string.Empty,
-                    ["vectorData"]  = item.VectorData != null
+                    ["jsonSchema"] = item.JsonSchema ?? string.Empty,
+                    ["vectorData"] = item.VectorData != null
                                         ? new BsonBinaryData(item.VectorData)
                                         : BsonNull.Value,
-                    ["schemaHash"]  = hash,
+                    ["schemaHash"] = currentHash,
                     ["lastUpdated"] = DateTime.UtcNow
                 };
 
-                // Upsert solo se l'hash è cambiato — equivalente del MERGE SQL Server
-                var filter = Builders<BsonDocument>.Filter.And(
-                    Builders<BsonDocument>.Filter.Eq("_id", item.TableName),
-                    Builders<BsonDocument>.Filter.Ne("schemaHash", hash)
-                );
+                // Filtriamo SOLO per _id per evitare l'errore DuplicateKey
+                var filter = Builders<BsonDocument>.Filter.Eq("_id", item.TableName);
 
                 try
                 {
                     await cacheCollection.ReplaceOneAsync(filter, doc, new ReplaceOptions { IsUpsert = true }, ct);
+                    _logger.LogInformation("Cache aggiornata/creata per {TableName}.", item.TableName);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Errore upsert embedding per {TableName}", item.TableName);
-                    throw;
+                    _logger.LogError(ex, "Errore durante l'upsert per {TableName}", item.TableName);
+                    throw; // Rilanciamo per fermare il processo in caso di errore critico
                 }
             }
 
-            // Rimuove dalla cache le collezioni che non esistono più nel DB
-            var deleteFilter = Builders<BsonDocument>.Filter.Nin("_id", activeNames);
-            await cacheCollection.DeleteManyAsync(deleteFilter, ct);
+            // 5. PULIZIA: Rimuoviamo gli schemi che non esistono più nel DB sorgente
+            if (activeNames.Any())
+            {
+                var deleteFilter = Builders<BsonDocument>.Filter.Nin("_id", activeNames);
+                await cacheCollection.DeleteManyAsync(deleteFilter, ct);
+            }
         }
 
         public async Task<IEnumerable<TableEmbeddingDTO>> GetAllEmbeddingsAsync(CancellationToken ct = default)
